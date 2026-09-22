@@ -5,6 +5,7 @@ import unittest
 import urllib.error
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import date
 from unittest.mock import patch
 
 from lib import grounding, parallel_mcp
@@ -104,7 +105,8 @@ class SerperSearchTests(unittest.TestCase):
                 },
             ]
         }
-        with patch("lib.grounding.http.request", return_value=mock_response):
+        with patch("lib.grounding.http.request", return_value=mock_response), \
+             patch("lib.grounding._today", return_value=date(2026, 3, 27)):
             items, _ = grounding.serper_search("test", ("2026-03-26", "2026-03-27"), "fake-key")
             self.assertEqual(2, len(items))
             self.assertEqual("Two Hours Old", items[0]["title"])
@@ -114,7 +116,7 @@ class SerperSearchTests(unittest.TestCase):
 
 
 class SerperRelativeDateTests(unittest.TestCase):
-    RANGE = ("2026-03-26", "2026-03-27")
+    TODAY = date(2026, 3, 27)
 
     def test_absolute_formats_are_unchanged(self):
         for raw, expected in (
@@ -123,9 +125,9 @@ class SerperRelativeDateTests(unittest.TestCase):
             ("2026-03-15", "2026-03-15"),
         ):
             with self.subTest(raw=raw):
-                self.assertEqual(expected, grounding._parse_serper_date(raw, self.RANGE))
+                self.assertEqual(expected, grounding._parse_serper_date(raw, self.TODAY))
 
-    def test_relative_units_resolve_against_window_end(self):
+    def test_relative_units_resolve_against_query_time(self):
         for raw, expected in (
             ("45 minutes ago", "2026-03-27"),
             ("2 hours ago", "2026-03-27"),
@@ -139,24 +141,28 @@ class SerperRelativeDateTests(unittest.TestCase):
             ("yesterday", "2026-03-26"),
         ):
             with self.subTest(raw=raw):
-                self.assertEqual(expected, grounding._parse_serper_date(raw, self.RANGE))
+                self.assertEqual(expected, grounding._parse_serper_date(raw, self.TODAY))
 
-    def test_window_end_is_used_instead_of_the_process_clock(self):
-        """A window from --as-of must not drift with the machine's own date."""
+    def test_historical_window_dates_against_query_time(self):
+        """A relative label describes age at query time, not age at the window end.
+
+        Searching a past window with --as-of still runs today, so Serper labels a
+        result from the window with its age as of today. Anchoring to the window
+        end would place it before the window and discard it.
+        """
         self.assertEqual(
-            "2024-01-09", grounding._parse_serper_date("1 day ago", ("2024-01-01", "2024-01-10"))
+            "2026-03-15",
+            grounding._parse_serper_date("12 days ago", today=date(2026, 3, 27)),
         )
 
     def test_unparseable_and_missing_dates_still_return_none(self):
         for raw in ("", "sometime last spring", "ago 2 days", "many hours ago"):
             with self.subTest(raw=raw):
-                self.assertIsNone(grounding._parse_serper_date(raw, self.RANGE))
+                self.assertIsNone(grounding._parse_serper_date(raw, self.TODAY))
 
-    def test_no_date_range_falls_back_to_none(self):
-        self.assertIsNone(grounding._parse_serper_date("2 hours ago"))
-
-    def test_malformed_date_range_is_tolerated(self):
-        self.assertIsNone(grounding._parse_serper_date("2 hours ago", ("", "not-a-date")))
+    def test_defaults_to_the_current_date(self):
+        with patch("lib.grounding._today", return_value=date(2026, 3, 27)):
+            self.assertEqual("2026-03-26", grounding._parse_serper_date("1 day ago"))
 
 
 class ExaSearchTests(unittest.TestCase):
