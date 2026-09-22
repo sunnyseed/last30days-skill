@@ -76,6 +76,88 @@ class SerperSearchTests(unittest.TestCase):
             self.assertEqual("2026-03-15", items[0]["date"])
             self.assertEqual("serper", artifact["label"])
 
+    def test_serper_search_keeps_relative_dates(self):
+        """Google renders recent results with a relative date, not an absolute one.
+
+        Before these were parsed, every fresh result failed the in-range check
+        and the web lane came back empty on short windows.
+        """
+        mock_response = {
+            "organic": [
+                {
+                    "title": "Two Hours Old",
+                    "link": "https://example.com/hours",
+                    "snippet": "Fresh enough that Google shows an hour count",
+                    "date": "2 hours ago",
+                },
+                {
+                    "title": "One Day Old",
+                    "link": "https://example.com/day",
+                    "snippet": "Yesterday, relative to the window end",
+                    "date": "1 day ago",
+                },
+                {
+                    "title": "Too Old",
+                    "link": "https://example.com/stale",
+                    "snippet": "Resolves before the window start",
+                    "date": "3 weeks ago",
+                },
+            ]
+        }
+        with patch("lib.grounding.http.request", return_value=mock_response):
+            items, _ = grounding.serper_search("test", ("2026-03-26", "2026-03-27"), "fake-key")
+            self.assertEqual(2, len(items))
+            self.assertEqual("Two Hours Old", items[0]["title"])
+            self.assertEqual("2026-03-27", items[0]["date"])
+            self.assertEqual("One Day Old", items[1]["title"])
+            self.assertEqual("2026-03-26", items[1]["date"])
+
+
+class SerperRelativeDateTests(unittest.TestCase):
+    RANGE = ("2026-03-26", "2026-03-27")
+
+    def test_absolute_formats_are_unchanged(self):
+        for raw, expected in (
+            ("Mar 15, 2026", "2026-03-15"),
+            ("March 15, 2026", "2026-03-15"),
+            ("2026-03-15", "2026-03-15"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(expected, grounding._parse_serper_date(raw, self.RANGE))
+
+    def test_relative_units_resolve_against_window_end(self):
+        for raw, expected in (
+            ("45 minutes ago", "2026-03-27"),
+            ("2 hours ago", "2026-03-27"),
+            ("23 hours ago", "2026-03-27"),
+            ("1 day ago", "2026-03-26"),
+            ("5 days ago", "2026-03-22"),
+            ("2 weeks ago", "2026-03-13"),
+            ("3 months ago", "2025-12-27"),
+            ("about 2 days ago", "2026-03-25"),
+            ("today", "2026-03-27"),
+            ("yesterday", "2026-03-26"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(expected, grounding._parse_serper_date(raw, self.RANGE))
+
+    def test_window_end_is_used_instead_of_the_process_clock(self):
+        """A window from --as-of must not drift with the machine's own date."""
+        self.assertEqual(
+            "2024-01-09", grounding._parse_serper_date("1 day ago", ("2024-01-01", "2024-01-10"))
+        )
+
+    def test_unparseable_and_missing_dates_still_return_none(self):
+        for raw in ("", "sometime last spring", "ago 2 days", "many hours ago"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(grounding._parse_serper_date(raw, self.RANGE))
+
+    def test_no_date_range_falls_back_to_none(self):
+        self.assertIsNone(grounding._parse_serper_date("2 hours ago"))
+
+    def test_malformed_date_range_is_tolerated(self):
+        self.assertIsNone(grounding._parse_serper_date("2 hours ago", ("", "not-a-date")))
+
 
 class ExaSearchTests(unittest.TestCase):
     def test_exa_search_filters_to_in_range_dated_items(self):

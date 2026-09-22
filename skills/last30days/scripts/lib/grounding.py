@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import urllib.parse
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 from . import dates, env, http, parallel_mcp, schema, web_search_keyless
@@ -145,7 +146,7 @@ def serper_search(
     items = []
     for i, r in enumerate((data.get("organic", []))[:count]):
         raw_date = r.get("date") or ""
-        pub_date = _parse_serper_date(raw_date)
+        pub_date = _parse_serper_date(raw_date, date_range)
         if not _in_date_range(pub_date, date_range):
             continue
         items.append({
@@ -203,7 +204,50 @@ def parallel_search(
     return items, artifact
 
 
-def _parse_serper_date(raw: str) -> str | None:
+_SERPER_RELATIVE_RE = re.compile(
+    r"^(?:about\s+)?(\d+)\s+(minute|min|hour|hr|day|week|month|year)s?\s+ago$", re.I
+)
+_SERPER_RELATIVE_DAYS = {"day": 1, "week": 7, "month": 30, "year": 365}
+_SERPER_RELATIVE_WORDS = {"just now": 0, "today": 0, "yesterday": 1}
+
+
+def _parse_serper_relative(raw: str, date_range: tuple[str, str] | None) -> str | None:
+    """Resolve Serper's relative dates ("2 hours ago") to an ISO date.
+
+    Google renders a relative date for recent results, so the fresher a result
+    is the more likely it arrives in this form. Without this the absolute-format
+    parser returns None and `_in_date_range` drops the item, which silently
+    empties the web lane on short research windows.
+
+    Resolved against `date_range[1]` — the end of the research window — rather
+    than the process clock, so a run whose window came from `--as-of` stays
+    consistent with it even when the process runs in a different timezone.
+
+    Sub-day units ("N minutes/hours ago") cannot be pinned to a calendar day
+    without knowing the current time, so they resolve to the window end. Such
+    items are less than a day old by definition, and Serper has already
+    restricted the response to the window via the `tbs` parameter.
+    """
+    if not date_range:
+        return None
+    try:
+        end = datetime.strptime(date_range[1], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    text = raw.strip().lower()
+    if text in _SERPER_RELATIVE_WORDS:
+        return (end - timedelta(days=_SERPER_RELATIVE_WORDS[text])).isoformat()
+    m = _SERPER_RELATIVE_RE.match(text)
+    if not m:
+        return None
+    amount = int(m.group(1))
+    unit = {"min": "minute", "hr": "hour"}.get(m.group(2), m.group(2))
+    if unit in ("minute", "hour"):
+        return end.isoformat()
+    return (end - timedelta(days=amount * _SERPER_RELATIVE_DAYS[unit])).isoformat()
+
+
+def _parse_serper_date(raw: str, date_range: tuple[str, str] | None = None) -> str | None:
     if not raw:
         return None
     normalized = _normalize_date(raw)
@@ -214,7 +258,7 @@ def _parse_serper_date(raw: str) -> str | None:
             return datetime.strptime(raw.strip(), fmt).date().isoformat()
         except ValueError:
             continue
-    return None
+    return _parse_serper_relative(raw, date_range)
 
 
 
