@@ -5,7 +5,7 @@ import unittest
 import urllib.error
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from datetime import date
+from datetime import datetime
 from unittest.mock import patch
 
 from lib import grounding, parallel_mcp
@@ -106,7 +106,7 @@ class SerperSearchTests(unittest.TestCase):
             ]
         }
         with patch("lib.grounding.http.request", return_value=mock_response), \
-             patch("lib.grounding._today", return_value=date(2026, 3, 27)):
+             patch("lib.grounding._now", return_value=datetime(2026, 3, 27, 12, 0)):
             items, _ = grounding.serper_search("test", ("2026-03-26", "2026-03-27"), "fake-key")
             self.assertEqual(2, len(items))
             self.assertEqual("Two Hours Old", items[0]["title"])
@@ -116,7 +116,7 @@ class SerperSearchTests(unittest.TestCase):
 
 
 class SerperRelativeDateTests(unittest.TestCase):
-    TODAY = date(2026, 3, 27)
+    NOON = datetime(2026, 3, 27, 12, 0)
 
     def test_absolute_formats_are_unchanged(self):
         for raw, expected in (
@@ -125,13 +125,12 @@ class SerperRelativeDateTests(unittest.TestCase):
             ("2026-03-15", "2026-03-15"),
         ):
             with self.subTest(raw=raw):
-                self.assertEqual(expected, grounding._parse_serper_date(raw, self.TODAY))
+                self.assertEqual(expected, grounding._parse_serper_date(raw, self.NOON))
 
     def test_relative_units_resolve_against_query_time(self):
         for raw, expected in (
             ("45 minutes ago", "2026-03-27"),
             ("2 hours ago", "2026-03-27"),
-            ("23 hours ago", "2026-03-27"),
             ("1 day ago", "2026-03-26"),
             ("5 days ago", "2026-03-22"),
             ("2 weeks ago", "2026-03-13"),
@@ -141,7 +140,7 @@ class SerperRelativeDateTests(unittest.TestCase):
             ("yesterday", "2026-03-26"),
         ):
             with self.subTest(raw=raw):
-                self.assertEqual(expected, grounding._parse_serper_date(raw, self.TODAY))
+                self.assertEqual(expected, grounding._parse_serper_date(raw, self.NOON))
 
     def test_historical_window_dates_against_query_time(self):
         """A relative label describes age at query time, not age at the window end.
@@ -152,17 +151,47 @@ class SerperRelativeDateTests(unittest.TestCase):
         """
         self.assertEqual(
             "2026-03-15",
-            grounding._parse_serper_date("12 days ago", today=date(2026, 3, 27)),
+            grounding._parse_serper_date("12 days ago", now=datetime(2026, 3, 27, 12, 0)),
         )
 
     def test_unparseable_and_missing_dates_still_return_none(self):
         for raw in ("", "sometime last spring", "ago 2 days", "many hours ago"):
             with self.subTest(raw=raw):
-                self.assertIsNone(grounding._parse_serper_date(raw, self.TODAY))
+                self.assertIsNone(grounding._parse_serper_date(raw, self.NOON))
 
-    def test_defaults_to_the_current_date(self):
-        with patch("lib.grounding._today", return_value=date(2026, 3, 27)):
+    def test_defaults_to_the_current_clock(self):
+        with patch("lib.grounding._now", return_value=datetime(2026, 3, 27, 12, 0)):
             self.assertEqual("2026-03-26", grounding._parse_serper_date("1 day ago"))
+
+    def test_sub_day_labels_cross_the_midnight_boundary(self):
+        """A sub-day age is exact, so it must not be rounded up to the query date.
+
+        Just after midnight, "23 hours ago" names yesterday. Stamping it with
+        today's date both misreports the publication date downstream and lets a
+        one-day window admit a result that falls outside it.
+        """
+        just_after_midnight = datetime(2026, 3, 27, 0, 30)
+        for raw, expected in (
+            ("23 hours ago", "2026-03-26"),
+            ("20 minutes ago", "2026-03-27"),
+            ("2 hours ago", "2026-03-26"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    expected, grounding._parse_serper_date(raw, just_after_midnight)
+                )
+
+    def test_absurd_ages_are_unparseable_rather_than_fatal(self):
+        """One malformed label must not take the whole web lane down with it.
+
+        The amount is unbounded, and a large enough one overflows `timedelta` or
+        runs off the end of `date`. That has to read as an unparseable date, the
+        same as any other junk value, not as an exception escaping the result
+        loop in `serper_search`.
+        """
+        for raw in ("999999999 years ago", "3000000 days ago", "99999999999 hours ago"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(grounding._parse_serper_date(raw, self.NOON))
 
 
 class ExaSearchTests(unittest.TestCase):

@@ -6,7 +6,7 @@ import re
 import sys
 import urllib.parse
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 from . import dates, env, http, parallel_mcp, schema, web_search_keyless
@@ -211,12 +211,12 @@ _SERPER_RELATIVE_DAYS = {"day": 1, "week": 7, "month": 30, "year": 365}
 _SERPER_RELATIVE_WORDS = {"just now": 0, "today": 0, "yesterday": 1}
 
 
-def _today() -> date:
-    """Query-time date. Isolated so tests can pin it."""
-    return datetime.now().date()
+def _now() -> datetime:
+    """Query-time clock. Isolated so tests can pin it."""
+    return datetime.now()
 
 
-def _parse_serper_relative(raw: str, today: date | None = None) -> str | None:
+def _parse_serper_relative(raw: str, now: datetime | None = None) -> str | None:
     """Resolve Serper's relative dates ("2 hours ago") to an ISO date.
 
     Google renders a relative date for recent results, so the fresher a result
@@ -225,31 +225,42 @@ def _parse_serper_relative(raw: str, today: date | None = None) -> str | None:
     short research windows.
 
     The label states the result's age **at query time**, so it resolves against
-    today rather than against the end of the research window. The two differ
+    the clock rather than against the end of the research window. The two differ
     whenever `--as-of` names a past window: a result inside a window ending two
     weeks ago is still labelled with its age as of today, and anchoring to the
     window end would place it a further two weeks back and discard it.
 
-    Sub-day units ("N minutes/hours ago") cannot be pinned to a calendar day
-    without knowing the current time, so they resolve to today. Both that and
-    the timezone of `_today()` carry up to a day of slack, which is inherent to
-    a label that only states an age.
+    Sub-day units ("N minutes/hours ago") are subtracted from the clock rather
+    than rounded up to the current date, which would name the wrong day across
+    midnight: at 00:30 "23 hours ago" is yesterday. Residual slack comes only
+    from the timezone `_now()` reads against Google's.
+
+    An age large enough to overflow `timedelta` or run past the end of `date`
+    reads as unparseable, like any other junk label, so one malformed value
+    cannot abort the whole result loop in `serper_search`.
     """
-    anchor = today or _today()
+    anchor = now or _now()
     text = raw.strip().lower()
     if text in _SERPER_RELATIVE_WORDS:
-        return (anchor - timedelta(days=_SERPER_RELATIVE_WORDS[text])).isoformat()
+        return (anchor.date() - timedelta(days=_SERPER_RELATIVE_WORDS[text])).isoformat()
     m = _SERPER_RELATIVE_RE.match(text)
     if not m:
         return None
     amount = int(m.group(1))
     unit = {"min": "minute", "hr": "hour"}.get(m.group(2), m.group(2))
-    if unit in ("minute", "hour"):
-        return anchor.isoformat()
-    return (anchor - timedelta(days=amount * _SERPER_RELATIVE_DAYS[unit])).isoformat()
+    try:
+        if unit == "minute":
+            return (anchor - timedelta(minutes=amount)).date().isoformat()
+        if unit == "hour":
+            return (anchor - timedelta(hours=amount)).date().isoformat()
+        return (
+            anchor.date() - timedelta(days=amount * _SERPER_RELATIVE_DAYS[unit])
+        ).isoformat()
+    except (OverflowError, ValueError):
+        return None
 
 
-def _parse_serper_date(raw: str, today: date | None = None) -> str | None:
+def _parse_serper_date(raw: str, now: datetime | None = None) -> str | None:
     if not raw:
         return None
     normalized = _normalize_date(raw)
@@ -260,7 +271,7 @@ def _parse_serper_date(raw: str, today: date | None = None) -> str | None:
             return datetime.strptime(raw.strip(), fmt).date().isoformat()
         except ValueError:
             continue
-    return _parse_serper_relative(raw, today)
+    return _parse_serper_relative(raw, now)
 
 
 
